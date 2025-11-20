@@ -150,20 +150,15 @@
         return '\t';
     }
 
-    function splitOnce(line, delimiter) {
-        const idx = line.indexOf(delimiter);
-        if (idx === -1) return [line];
-        return [line.slice(0, idx), line.slice(idx + delimiter.length)];
-    }
-
     function parseTableText(name, text) {
         const delimiter = detectDelimiter(name);
-        const lines = text.split(/\\r?\\n/).filter(l => l.length > 0);
+        // Разбиваем именно по реальным переводам строк, а не по символам "\r" "\n"
+        const lines = text.split(/\r?\n/).filter(l => l.length > 0);
         if (lines.length === 0) {
             return { rows: [], header: [], delimiter };
         }
 
-        const header = splitOnce(lines[0], delimiter);
+        const header = lines[0].split(delimiter);
         const idIndex = header.indexOf('ID');
         const textIndex = header.indexOf('OriginalText');
         const idCol = idIndex >= 0 ? idIndex : 0;
@@ -171,10 +166,11 @@
 
         const rows = [];
         for (let i = 1; i < lines.length; i++) {
-            const parts = splitOnce(lines[i], delimiter);
-            const id = (parts[0] || '').trim();
+            const parts = lines[i].split(delimiter);
+            if (parts.length <= Math.max(idCol, txtCol)) continue;
+            const id = (parts[idCol] || '').trim();
             if (!id) continue;
-            const txt = parts.length > 1 ? parts[1] : '';
+            const txt = parts[txtCol] || '';
             rows.push({ id, text: txt });
         }
 
