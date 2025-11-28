@@ -167,8 +167,7 @@
 <script>
     // Доступные файлы машинного перевода (AI)
     const aiFiles = [
-        { file: 'zog_ru.tsv', name: 'ZOG – машинный перевод' },
-        { file: 'noname_ru.tsv', name: 'Noname – машинный перевод' },
+        { file: 'grok_and_editing_user_ru.tsv', name: 'Grok + Редактура' },
     ];
 
     // Доступные языковые файлы для сравнения
@@ -310,9 +309,8 @@
             // Определяем выбранные файлы
             const aiSelect = document.getElementById('aiFileSelect');
             const langSelect = document.getElementById('langFileSelect');
-            const aiIndex = aiSelect ? parseInt(aiSelect.value, 10) || 0 : 0;
+            const hasAi = aiSelect && aiSelect.value !== '-1';
             const langIndex = langSelect ? parseInt(langSelect.value, 10) || 0 : 0;
-            const aiCfg = aiFiles[Math.max(0, Math.min(aiIndex, aiFiles.length - 1))];
             const langCfg = languageFiles[Math.max(0, Math.min(langIndex, languageFiles.length - 1))];
 
             // Загружаем основной файл перевода (не переключается)
@@ -325,10 +323,15 @@
             setPreloader(40, 'Загрузка языкового файла...');
             const langRows = await loadFile(`../${langCfg.file}`);
 
-            // Загружаем выбранный AI-файл
-            loadingInfo.textContent = `Загрузка translates_ai/${aiCfg.file}...`;
-            setPreloader(65, 'Загрузка AI-файла...');
-            const aiRows = await loadFile(`../translates_ai/${aiCfg.file}`);
+            // Загружаем выбранный AI-файл (если он выбран)
+            let aiRows = [];
+            if (hasAi) {
+                const aiIndex = parseInt(aiSelect.value, 10) || 0;
+                const aiCfg = aiFiles[Math.max(0, Math.min(aiIndex, aiFiles.length - 1))];
+                loadingInfo.textContent = `Загрузка translates_ai/${aiCfg.file}...`;
+                setPreloader(65, 'Загрузка AI-файла...');
+                aiRows = await loadFile(`../translates_ai/${aiCfg.file}`);
+            }
 
             // Подсчитываем статистику для основного перевода
             loadingInfo.textContent = 'Обработка данных...';
@@ -367,18 +370,27 @@
             if (cnRUPercentEl) cnRUPercentEl.textContent = `${coveredPercent}%`;
 
             // Дополнительная статистика по машинному RU (AI) относительно основного перевода
-            const extraRu = Math.max(aiStats.ru - mainStats.ru, 0);
-            const ruShareInAi = aiStats.total > 0 ? ((aiStats.ru / aiStats.total) * 100).toFixed(1) : 0;
+            const extraRu = hasAi ? Math.max(aiStats.ru - mainStats.ru, 0) : 0;
+            const ruShareInAi = hasAi && aiStats.total > 0 ? ((aiStats.ru / aiStats.total) * 100).toFixed(1) : 0;
             // Доля основного RU от машинного RU (вменяемый процент, не больше 100)
-            const ruRatio = aiStats.ru > 0 ? ((mainStats.ru / aiStats.ru) * 100).toFixed(1) : 0;
-            const extraRuShareInAi = aiStats.total > 0 ? ((extraRu / aiStats.total) * 100).toFixed(1) : 0;
+            const ruRatio = hasAi && aiStats.ru > 0 ? ((mainStats.ru / aiStats.ru) * 100).toFixed(1) : 0;
+            const extraRuShareInAi = hasAi && aiStats.total > 0 ? ((extraRu / aiStats.total) * 100).toFixed(1) : 0;
 
-            document.getElementById('uniqueTotal').textContent = extraRu.toLocaleString();
-            document.getElementById('uniqueRU').textContent = aiStats.ru.toLocaleString();
-            document.getElementById('uniqueRUPercent').textContent = `${ruShareInAi}%`;
-            document.getElementById('uniqueEN').textContent = mainStats.ru.toLocaleString();
-            document.getElementById('uniqueENPercent').textContent = `${ruRatio}%`;
-            document.getElementById('uniqueEmpty').textContent = `${extraRuShareInAi}%`;
+            if (hasAi) {
+                document.getElementById('uniqueTotal').textContent = extraRu.toLocaleString();
+                document.getElementById('uniqueRU').textContent = aiStats.ru.toLocaleString();
+                document.getElementById('uniqueRUPercent').textContent = `${ruShareInAi}%`;
+                document.getElementById('uniqueEN').textContent = mainStats.ru.toLocaleString();
+                document.getElementById('uniqueENPercent').textContent = `${ruRatio}%`;
+                document.getElementById('uniqueEmpty').textContent = `${extraRuShareInAi}%`;
+            } else {
+                document.getElementById('uniqueTotal').textContent = '—';
+                document.getElementById('uniqueRU').textContent = '—';
+                document.getElementById('uniqueRUPercent').textContent = '—';
+                document.getElementById('uniqueEN').textContent = '—';
+                document.getElementById('uniqueENPercent').textContent = '—';
+                document.getElementById('uniqueEmpty').textContent = '—';
+            }
 
             // Диаграмма статуса перевода
             const machineOnly = extraRu;// строки только с машинным переводом (AI)
@@ -437,6 +449,12 @@
         const langSelect = document.getElementById('langFileSelect');
 
         if (aiSelect && aiSelect.options.length === 0) {
+            // Опция по умолчанию — без AI-перевода
+            const noneOpt = document.createElement('option');
+            noneOpt.value = '-1';
+            noneOpt.textContent = 'Нет (без AI-перевода)';
+            aiSelect.appendChild(noneOpt);
+
             aiFiles.forEach((cfg, index) => {
                 const opt = document.createElement('option');
                 opt.value = String(index);
