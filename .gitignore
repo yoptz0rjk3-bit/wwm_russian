@@ -43,6 +43,9 @@ ENV/
 *.backup
 /.vs
 /.gitignore
-/.gitignore
-/.gitignore
-/.gitignore
+
+#multitool garbage
+sort.txt
+select_translation_*.tsv
+*_sort.tsv
+*_debug.tsv

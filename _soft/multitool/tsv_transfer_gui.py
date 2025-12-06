@@ -1,0 +1,1115 @@
+import sys
+import os
+import csv
+import re
+import subprocess
+import random
+
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtGui import QTextCursor
+
+
+class ValidatorThread(QtCore.QThread):
+    """Фоновый поток для запуска внешних валидаторов без подвисания GUI."""
+
+    log_signal = QtCore.pyqtSignal(str)
+    finished_signal = QtCore.pyqtSignal(int, str)  # returncode, description
+
+    def __init__(self, script_path: str, args: list[str] | None, description: str):
+        super().__init__()
+        self.script_path = script_path
+        self.args = args or []
+        self.description = description
+
+    def run(self):
+        try:
+            cmd = [sys.executable, self.script_path] + self.args
+            self.log_signal.emit(f"=== {self.description} ===")
+            self.log_signal.emit("Запуск: " + " ".join(cmd))
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd=os.path.dirname(self.script_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    self.log_signal.emit(line.rstrip("\n\r"))
+
+            proc.wait()
+            returncode = proc.returncode
+        except Exception as e:
+            self.log_signal.emit(f"Ошибка запуска валидатора {self.description}: {e}")
+            returncode = -1
+
+        self.finished_signal.emit(returncode, self.description)
+
+
+def load_tsv(path):
+    """Загрузка TSV-файла: возвращает (header, rows[list[list[str]]])."""
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        # Используем стандартные настройки CSV (QUOTE_MINIMAL по умолчанию)
+        # Это позволяет корректно обрабатывать кавычки и специальные символы
+        reader = csv.reader(f, delimiter='\t')
+        try:
+            header = next(reader)
+        except StopIteration:
+            return [], []
+        rows = [row for row in reader]
+    return header, rows
+
+
+def save_tsv(path, header, rows):
+    """Сохранение TSV-файла."""
+    with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+        # Используем стандартные настройки CSV (QUOTE_MINIMAL по умолчанию)
+        # Это позволяет корректно обрабатывать кавычки и специальные символы
+        writer = csv.writer(f, delimiter='\t')
+        if header:
+            writer.writerow(header)
+        writer.writerows(rows)
+
+
+def find_column_index(header, name, default_index=0):
+    """Найти индекс колонки по имени, либо вернуть default_index."""
+    try:
+        return header.index(name)
+    except ValueError:
+        return default_index if len(header) > default_index else 0
+
+
+def has_cyrillic(text):
+    """Проверка, содержит ли текст кириллицу."""
+    return bool(re.search(r'[А-Яа-яЁё]', text or ""))
+
+
+def has_chinese(text):
+    """Проверка, содержит ли текст китайские иероглифы (базовый диапазон CJK)."""
+    return bool(re.search(r'[\u4e00-\u9fff]', text or ""))
+
+
+def has_broken_param_ru_underscore(text):
+    """
+    Сломанный параметр вида: русские буквы_русские буквы,
+    например: 'А_Б', 'ру_тест' и т.п.
+    """
+    return bool(re.search(r'[А-Яа-яЁё]+_[А-Яа-яЁё]+', text or ""))
+
+
+def transfer_new_ids(path_a, path_b):
+    """
+    Переносит строки с новыми ID из A в B.
+    Возвращает количество добавленных строк.
+    """
+    if not os.path.isfile(path_a):
+        raise FileNotFoundError(f"Файл A не найден: {path_a}")
+    if not os.path.isfile(path_b):
+        raise FileNotFoundError(f"Файл B не найден: {path_b}")
+
+    header_a, rows_a = load_tsv(path_a)
+    header_b, rows_b = load_tsv(path_b)
+
+    # Определяем индексы ID
+    id_idx_a = find_column_index(header_a, 'ID', 0)
+    id_idx_b = find_column_index(header_b, 'ID', 0)
+
+    # Множество ID из B
+    ids_b = set()
+    for row in rows_b:
+        if len(row) > id_idx_b:
+            ids_b.add(row[id_idx_b])
+
+    added = 0
+    # Используем header B, если он есть, иначе header A
+    target_header = header_b if header_b else header_a
+
+    # Выравниваем количество колонок в строках к длине target_header
+    def normalize_row(row, size):
+        if len(row) < size:
+            return row + [''] * (size - len(row))
+        elif len(row) > size:
+            return row[:size]
+        return row
+
+    size = len(target_header)
+
+    # Перебираем строки из A, добавляем, если ID новый
+    for row in rows_a:
+        if len(row) <= id_idx_a:
+            continue
+        row_id = row[id_idx_a]
+        if row_id not in ids_b:
+            normalized = normalize_row(row, size)
+            rows_b.append(normalized)
+            ids_b.add(row_id)
+            added += 1
+
+    # Сохраняем обратно в B
+    save_tsv(path_b, target_header, rows_b)
+    return added
+
+
+def remove_duplicates_in_b(path_b):
+    """
+    Удаляет дубли по ID в файле B.
+    Приоритет: оставить строку С КИРИЛЛИЦЕЙ (русский), удалить без кириллицы (английский).
+    Если все с кириллицей или все без — оставить первую, остальные удалить.
+
+    Возвращает количество удалённых строк.
+    """
+    if not os.path.isfile(path_b):
+        raise FileNotFoundError(f"Файл B не найден: {path_b}")
+
+    header_b, rows_b = load_tsv(path_b)
+    if not rows_b:
+        return 0
+
+    id_idx = find_column_index(header_b, 'ID', 0)
+    text_idx = find_column_index(header_b, 'OriginalText', 1 if len(header_b) > 1 else 0)
+
+    seen = {}  # ID -> (best_row, has_cyrillic_best)
+    original_count = len(rows_b)
+
+    for row in rows_b:
+        if len(row) <= id_idx:
+            # Строка без ID — можно либо пропустить, либо считать отдельной.
+            # Считаем "ID" пустой строкой.
+            row_id = ''
+        else:
+            row_id = row[id_idx]
+
+        text = row[text_idx] if len(row) > text_idx else ''
+        cyr = has_cyrillic(text)
+
+        if row_id not in seen:
+            seen[row_id] = (row, cyr)
+        else:
+            best_row, best_cyr = seen[row_id]
+            # Если текущий с кириллицей, а лучший без кириллицы — заменяем
+            if (not best_cyr) and cyr:
+                seen[row_id] = (row, cyr)
+            # Иначе оставляем как есть (приоритета нет)
+
+    # Результирующие строки в порядке первого появления ID
+    result_rows = [value[0] for value in seen.values()]
+    removed = original_count - len(result_rows)
+
+    save_tsv(path_b, header_b, result_rows)
+    return removed
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("TSV перенос ID и удаление дублей (PyQt5)")
+        self.resize(700, 300)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+
+        layout = QtWidgets.QVBoxLayout(central)
+
+        # Блок выбора файлов A и B
+        file_layout = QtWidgets.QGridLayout()
+
+        self.edit_a = QtWidgets.QLineEdit()
+        self.btn_browse_a = QtWidgets.QPushButton("Обзор A...")
+        self.btn_browse_a.clicked.connect(self.browse_a)
+
+        self.edit_b = QtWidgets.QLineEdit()
+        self.btn_browse_b = QtWidgets.QPushButton("Обзор B...")
+        self.btn_browse_b.clicked.connect(self.browse_b)
+
+        file_layout.addWidget(QtWidgets.QLabel("Файл A (источник):"), 0, 0)
+        file_layout.addWidget(self.edit_a, 0, 1)
+        file_layout.addWidget(self.btn_browse_a, 0, 2)
+
+        file_layout.addWidget(QtWidgets.QLabel("Файл B (приёмник):"), 1, 0)
+        file_layout.addWidget(self.edit_b, 1, 1)
+        file_layout.addWidget(self.btn_browse_b, 1, 2)
+
+        layout.addLayout(file_layout)
+
+        # Кнопки действий
+        btn_layout = QtWidgets.QHBoxLayout()
+        self.btn_transfer = QtWidgets.QPushButton("1. Перенести новые ID из A в B")
+        self.btn_transfer.clicked.connect(self.handle_transfer)
+
+        self.btn_replace_fields = QtWidgets.QPushButton("1a. Заменить поля с A в B")
+        self.btn_replace_fields.clicked.connect(self.handle_replace_fields)
+
+        self.btn_remove_dups = QtWidgets.QPushButton("2. Удалить дубли по ID в B")
+        self.btn_remove_dups.clicked.connect(self.handle_remove_dups)
+
+        btn_layout.addWidget(self.btn_transfer)
+        btn_layout.addWidget(self.btn_replace_fields)
+        btn_layout.addWidget(self.btn_remove_dups)
+
+        layout.addLayout(btn_layout)
+
+        # Дополнительные кнопки: валидация TSV, поиск китайских символов и теги для файла B
+        validate_layout = QtWidgets.QHBoxLayout()
+        self.btn_validate_tsv = QtWidgets.QPushButton("3. Проверить TSV B (формат)")
+        self.btn_validate_tsv.clicked.connect(self.handle_validate_tsv)
+
+        self.btn_find_cn = QtWidgets.QPushButton("4. Найти китайские ID в B")
+        self.btn_find_cn.clicked.connect(self.handle_find_chinese_in_b)
+
+        self.btn_validate_tags = QtWidgets.QPushButton("5. Проверить теги в B")
+        self.btn_validate_tags.clicked.connect(self.handle_validate_tags)
+
+        self.btn_find_broken_params = QtWidgets.QPushButton("6. Сломанные параметры (RU_RU с _)")
+        self.btn_find_broken_params.clicked.connect(self.handle_find_broken_params)
+
+        validate_layout.addWidget(self.btn_validate_tsv)
+        validate_layout.addWidget(self.btn_find_cn)
+        validate_layout.addWidget(self.btn_validate_tags)
+        validate_layout.addWidget(self.btn_find_broken_params)
+
+        layout.addLayout(validate_layout)
+
+        # Небольшой разделитель
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(separator)
+
+        # Блок операций по тексту в файле B
+        text_ops_layout = QtWidgets.QVBoxLayout()
+
+        text_filter_layout = QtWidgets.QHBoxLayout()
+        text_filter_layout.addWidget(QtWidgets.QLabel("Фрагмент текста для поиска в B (OriginalText):"))
+        self.edit_text_filter = QtWidgets.QLineEdit()
+        text_filter_layout.addWidget(self.edit_text_filter)
+        text_ops_layout.addLayout(text_filter_layout)
+
+        text_btns_layout = QtWidgets.QHBoxLayout()
+        self.btn_find_ids_by_text = QtWidgets.QPushButton("Найти ID по тексту (B)")
+        self.btn_find_ids_by_text.clicked.connect(self.handle_find_ids_by_text)
+
+        self.btn_delete_by_text = QtWidgets.QPushButton("Удалить строки по тексту (B)")
+        self.btn_delete_by_text.clicked.connect(self.handle_delete_by_text)
+
+        self.btn_replace_by_text = QtWidgets.QPushButton("Заменить из A строки по тексту (B)")
+        self.btn_replace_by_text.clicked.connect(self.handle_replace_by_text)
+
+        self.btn_cut_by_text = QtWidgets.QPushButton("Вырезать строки по тексту в select_*.tsv")
+        self.btn_cut_by_text.clicked.connect(self.handle_cut_by_text)
+
+        text_btns_layout.addWidget(self.btn_find_ids_by_text)
+        text_btns_layout.addWidget(self.btn_delete_by_text)
+        text_btns_layout.addWidget(self.btn_replace_by_text)
+        text_btns_layout.addWidget(self.btn_cut_by_text)
+
+        text_ops_layout.addLayout(text_btns_layout)
+
+        # Кнопка создания debug_*.tsv с UUID-тегами в начале текста
+        debug_btn_layout = QtWidgets.QHBoxLayout()
+        self.btn_create_debug_tsv = QtWidgets.QPushButton("Создать debug_*.tsv с [UUID] в тексте (B)")
+        self.btn_create_debug_tsv.clicked.connect(self.handle_create_debug_tsv)
+        debug_btn_layout.addWidget(self.btn_create_debug_tsv)
+        debug_btn_layout.addStretch(1)
+        text_ops_layout.addLayout(debug_btn_layout)
+
+        layout.addLayout(text_ops_layout)
+
+        # Лог
+        self.log = QtWidgets.QTextEdit()
+        self.log.setReadOnly(True)
+
+        # Кнопка очистки лога
+        clear_layout = QtWidgets.QHBoxLayout()
+        self.btn_clear_log = QtWidgets.QPushButton("Очистить лог")
+        self.btn_clear_log.clicked.connect(self.handle_clear_log)
+        clear_layout.addStretch(1)
+        clear_layout.addWidget(self.btn_clear_log)
+
+        layout.addWidget(self.log)
+        layout.addLayout(clear_layout)
+
+        # Текущий поток-валидатор (чтобы не собрать GC)
+        self.validator_thread: ValidatorThread | None = None
+
+    def browse_a(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Выберите TSV-файл A (источник)",
+            "",
+            "TSV files (*.tsv);;All files (*.*)"
+        )
+        if path:
+            self.edit_a.setText(path)
+
+    def browse_b(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Выберите TSV-файл B (приёмник)",
+            "",
+            "TSV files (*.tsv);;All files (*.*)"
+        )
+        if path:
+            self.edit_b.setText(path)
+
+    def append_log(self, text):
+        self.log.append(text)
+        self.log.moveCursor(QTextCursor.End)
+
+    def handle_transfer(self):
+        path_a = self.edit_a.text().strip()
+        path_b = self.edit_b.text().strip()
+
+        if not path_a or not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите пути к файлам A и B.")
+            return
+
+        try:
+            added = transfer_new_ids(path_a, path_b)
+            msg = f"Перенос завершён. Добавлено строк: {added}."
+            QtWidgets.QMessageBox.information(self, "Готово", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка переноса: {e}")
+
+    def handle_remove_dups(self):
+        path_b = self.edit_b.text().strip()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+
+        try:
+            removed = remove_duplicates_in_b(path_b)
+            msg = f"Удаление дублей завершено. Удалено строк: {removed}."
+            QtWidgets.QMessageBox.information(self, "Готово", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка удаления дублей: {e}")
+
+    def handle_replace_fields(self):
+        """
+        Полная замена строк в B данными из A по совпадению ID.
+        Перед выполнением спрашивает подтверждение.
+        """
+        path_a = self.edit_a.text().strip()
+        path_b = self.edit_b.text().strip()
+
+        if not path_a or not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите пути к файлам A и B.")
+            return
+        if not os.path.isfile(path_a):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл A не найден: {path_a}")
+            return
+        if not os.path.isfile(path_b):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл B не найден: {path_b}")
+            return
+
+        try:
+            header_a, rows_a = load_tsv(path_a)
+            header_b, rows_b = load_tsv(path_b)
+
+            if not rows_b:
+                msg = "Файл B пуст или без данных. Замена не требуется."
+                QtWidgets.QMessageBox.information(self, "Замена полей", msg)
+                self.append_log(msg)
+                return
+
+            id_idx_a = find_column_index(header_a, 'ID', 0)
+            id_idx_b = find_column_index(header_b, 'ID', 0)
+            size_b = len(header_b)
+
+            def normalize_row(row):
+                """Подгоняем строку под длину header B."""
+                if len(row) < size_b:
+                    return row + [''] * (size_b - len(row))
+                elif len(row) > size_b:
+                    return row[:size_b]
+                return row
+
+            map_a = {}
+            for row in rows_a:
+                if len(row) > id_idx_a:
+                    rid = row[id_idx_a]
+                    if rid:
+                        map_a[rid] = row
+
+            new_rows = []
+            replaced = 0
+
+            for row in rows_b:
+                if len(row) > id_idx_b:
+                    rid = row[id_idx_b]
+                    if rid in map_a:
+                        new_rows.append(normalize_row(map_a[rid]))
+                        replaced += 1
+                        continue
+                new_rows.append(row)
+
+            if replaced == 0:
+                msg = "В B нет ID, которые присутствуют в A. Замена не выполнена."
+                QtWidgets.QMessageBox.information(self, "Замена полей", msg)
+                self.append_log(msg)
+                return
+
+            confirm_msg = (
+                f"Найдено совпадающих ID: {replaced}.\n"
+                f"Заменить соответствующие строки в B данными из A?"
+            )
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Подтверждение замены",
+                confirm_msg,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+
+            if reply != QtWidgets.QMessageBox.Yes:
+                self.append_log("Замена полей отменена пользователем.")
+                return
+
+            save_tsv(path_b, header_b, new_rows)
+            msg = f"Замена завершена. Обновлено строк: {replaced}."
+            QtWidgets.QMessageBox.information(self, "Замена полей", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка замены полей: {e}")
+
+    def handle_clear_log(self):
+        """Очистка окна лога."""
+        self.log.clear()
+
+    # Запуск внешних валидаторов (из репозитория wwm_russian/.github/scripts) в фоне
+    def run_validator_script(self, script_relative_path, args=None, description=""):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            repo_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
+
+            # Если передан абсолютный путь — используем его, иначе собираем из .github/scripts
+            if os.path.isabs(script_relative_path):
+                script_path = script_relative_path
+            else:
+                script_path = os.path.join(repo_root, ".github", "scripts", script_relative_path)
+
+            if not os.path.isfile(script_path):
+                raise FileNotFoundError(f"Скрипт валидатора не найден: {script_path}")
+
+            name = description or os.path.basename(script_path)
+
+            # Если предыдущий поток ещё жив – можно либо дождаться, либо просто запустить новый.
+            # Проще: не даём запускать второй валидатор параллельно.
+            if self.validator_thread is not None and self.validator_thread.isRunning():
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Валидатор",
+                    "Другой валидатор ещё выполняется. Дождитесь завершения.",
+                )
+                return
+
+            self.validator_thread = ValidatorThread(script_path, args, name)
+            self.validator_thread.log_signal.connect(self.append_log)
+            self.validator_thread.finished_signal.connect(self.on_validator_finished)
+            self.validator_thread.start()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка валидатора", str(e))
+            self.append_log(f"Ошибка запуска валидатора {description or script_relative_path}: {e}")
+
+    def on_validator_finished(self, returncode: int, description: str):
+        if returncode == 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Валидатор",
+                f"{description} завершился успешно (код 0).",
+            )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Валидатор",
+                f"{description} завершился с кодом {returncode}. Подробности см. в логе.",
+            )
+
+    def handle_validate_tsv(self):
+        path_b = self.edit_b.text().strip()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+
+        # validate_tsv.py принимает путь к файлу как аргумент
+        self.run_validator_script(
+            "validate_tsv.py",
+            args=[path_b],
+            description="Проверка TSV B (validate_tsv.py)",
+        )
+
+    def handle_validate_tags(self):
+        """
+        Запуск validate_tags.py.
+        Скрипт сам берёт translation_ru.tsv / translation_en.tsv из папки wwm_russian,
+        так что имеет смысл использовать его, когда файл B — это translation_ru.tsv.
+        """
+        self.run_validator_script(
+            "validate_tags.py",
+            description="Проверка тегов (validate_tags.py)",
+        )
+
+    def handle_find_chinese_in_b(self):
+        """
+        Поиск строк с китайскими иероглифами в файле B.
+        Выводит в лог ID (и при желании можно расширить до текста).
+        После нахождения предлагает переместить их в конец файла.
+        """
+        path_b = self.edit_b.text().strip()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not os.path.isfile(path_b):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл B не найден: {path_b}")
+            return
+
+        try:
+            header_b, rows_b = load_tsv(path_b)
+            if not rows_b:
+                QtWidgets.QMessageBox.information(self, "Результат", "Файл B пуст или без данных.")
+                return
+
+            id_idx = find_column_index(header_b, 'ID', 0)
+            text_idx = find_column_index(header_b, 'OriginalText', 1 if len(header_b) > 1 else 0)
+
+            total = 0
+            ids = []
+            chinese_indices = []
+
+            for idx, row in enumerate(rows_b):
+                if len(row) <= max(id_idx, text_idx):
+                    continue
+                text = row[text_idx]
+                if has_chinese(text):
+                    total += 1
+                    row_id = row[id_idx] if len(row) > id_idx else ''
+                    ids.append((row_id, text))
+                    chinese_indices.append(idx)
+
+            if total == 0:
+                msg = "Китайские символы в файле B не найдены."
+                QtWidgets.QMessageBox.information(self, "Поиск китайских символов", msg)
+                self.append_log(msg)
+                return
+
+            msg = (
+                f"Найдено строк с китайскими символами: {total}. "
+                f"ID выведены ниже."
+            )
+
+            self.append_log(msg)
+            for rid, text in ids:
+                # Показываем небольшой фрагмент текста для наглядности
+                snippet = text
+                if len(snippet) > 80:
+                    snippet = snippet[:77] + "..."
+                self.append_log(f"ID (CN): {rid} — {snippet}")
+
+            # Спрашиваем, нужно ли переместить все такие строки в конец файла B
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Китайские символы",
+                (
+                    f"{msg}\n\n"
+                    f"Переместить все эти строки (кол-во: {total}) в конец файла B?\n"
+                    f"Порядок внутри группы будет сохранён."
+                ),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Сохраняем порядок: сначала все нормальные строки, потом с китайскими символами
+                chinese_set = set(chinese_indices)
+                kept_rows = [row for i, row in enumerate(rows_b) if i not in chinese_set]
+                chinese_rows = [rows_b[i] for i in chinese_indices]
+                new_rows = kept_rows + chinese_rows
+
+                save_tsv(path_b, header_b, new_rows)
+                move_msg = (
+                    f"Строки с китайскими символами перемещены в конец файла B. "
+                    f"Всего перемещено: {total}."
+                )
+                self.append_log(move_msg)
+                QtWidgets.QMessageBox.information(self, "Китайские символы", move_msg)
+            else:
+                QtWidgets.QMessageBox.information(self, "Китайские символы", msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка поиска китайских символов: {e}")
+
+    def handle_find_broken_params(self):
+        """
+        Поиск "сломанных параметров" в файле B:
+        русские_русские (буквы с обеих сторон от подчёркивания).
+        Выводит ID таких строк.
+        """
+        path_b = self.edit_b.text().strip()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not os.path.isfile(path_b):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл B не найден: {path_b}")
+            return
+
+        try:
+            header_b, rows_b = load_tsv(path_b)
+            if not rows_b:
+                QtWidgets.QMessageBox.information(self, "Результат", "Файл B пуст или без данных.")
+                return
+
+            id_idx = find_column_index(header_b, 'ID', 0)
+            text_idx = find_column_index(header_b, 'OriginalText', 1 if len(header_b) > 1 else 0)
+
+            total = 0
+            ids = []
+            broken_indices = []
+
+            for idx, row in enumerate(rows_b):
+                if len(row) <= max(id_idx, text_idx):
+                    continue
+                text = row[text_idx]
+                if has_broken_param_ru_underscore(text):
+                    total += 1
+                    row_id = row[id_idx] if len(row) > id_idx else ''
+                    ids.append((row_id, text))
+                    broken_indices.append(idx)
+
+            if total == 0:
+                msg = "Сломанные параметры (РУ_РУ) в файле B не найдены."
+                QtWidgets.QMessageBox.information(self, "Сломанные параметры", msg)
+                self.append_log(msg)
+                return
+
+            msg = (
+                f"Найдено строк со сломанными параметрами (РУ_РУ с подчёркиванием): {total}. "
+                f"ID выведены ниже."
+            )
+
+            self.append_log(msg)
+            for rid, text in ids:
+                # Показываем небольшой фрагмент текста для наглядности
+                snippet = text
+                if len(snippet) > 80:
+                    snippet = snippet[:77] + "..."
+                self.append_log(f"ID (BROKEN_PARAM): {rid} — {snippet}")
+
+            # Спрашиваем, нужно ли переместить все такие строки в конец файла B
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Сломанные параметры",
+                (
+                    f"{msg}\n\n"
+                    f"Переместить все эти строки (кол-во: {total}) в конец файла B?\n"
+                    f"Порядок внутри группы будет сохранён."
+                ),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Сохраняем порядок: сначала все нормальные строки, потом сломанные
+                broken_set = set(broken_indices)
+                kept_rows = [row for i, row in enumerate(rows_b) if i not in broken_set]
+                broken_rows = [rows_b[i] for i in broken_indices]
+                new_rows = kept_rows + broken_rows
+
+                save_tsv(path_b, header_b, new_rows)
+                move_msg = (
+                    f"Строки со сломанными параметрами перемещены в конец файла B. "
+                    f"Всего перемещено: {total}."
+                )
+                self.append_log(move_msg)
+                QtWidgets.QMessageBox.information(self, "Сломанные параметры", move_msg)
+            else:
+                QtWidgets.QMessageBox.information(self, "Сломанные параметры", msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка поиска сломанных параметров: {e}")
+
+    # --- Операции по фрагменту текста в файле B ---
+
+    def _get_text_filter(self) -> str:
+        return self.edit_text_filter.text().strip()
+
+    def _load_b_with_indices(self, path_b):
+        header_b, rows_b = load_tsv(path_b)
+        if not rows_b:
+            raise ValueError("Файл B пуст или без данных.")
+        id_idx = find_column_index(header_b, 'ID', 0)
+        text_idx = find_column_index(header_b, 'OriginalText', 1 if len(header_b) > 1 else 0)
+        return header_b, rows_b, id_idx, text_idx
+
+    def handle_find_ids_by_text(self):
+        """Поиск всех ID в B, где OriginalText содержит заданный фрагмент."""
+        path_b = self.edit_b.text().strip()
+        fragment = self._get_text_filter()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not fragment:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Введите фрагмент текста для поиска.")
+            return
+
+        try:
+            header_b, rows_b, id_idx, text_idx = self._load_b_with_indices(path_b)
+
+            total = 0
+            ids = []
+
+            for row in rows_b:
+                if len(row) <= max(id_idx, text_idx):
+                    continue
+                text = row[text_idx]
+                if fragment in text:
+                    total += 1
+                    row_id = row[id_idx] if len(row) > id_idx else ''
+                    ids.append(row_id)
+
+            if total == 0:
+                msg = f"Строк с фрагментом текста '{fragment}' в файле B не найдено."
+            else:
+                msg = f"Найдено строк с фрагментом '{fragment}' в B: {total}. ID выведены ниже."
+
+            self.append_log(msg)
+            for rid in ids:
+                self.append_log(f"ID (TEXT='{fragment}'): {rid}")
+
+            QtWidgets.QMessageBox.information(self, "Поиск по тексту", msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка поиска по тексту: {e}")
+
+    def handle_delete_by_text(self):
+        """Удалить из B все строки, где OriginalText содержит фрагмент."""
+        path_b = self.edit_b.text().strip()
+        fragment = self._get_text_filter()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not fragment:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Введите фрагмент текста для удаления.")
+            return
+
+        try:
+            header_b, rows_b, id_idx, text_idx = self._load_b_with_indices(path_b)
+
+            original_count = len(rows_b)
+            kept_rows = []
+            removed = 0
+
+            for row in rows_b:
+                if len(row) <= max(id_idx, text_idx):
+                    kept_rows.append(row)
+                    continue
+                text = row[text_idx]
+                if fragment in text:
+                    removed += 1
+                else:
+                    kept_rows.append(row)
+
+            if removed == 0:
+                msg = f"В файле B нет строк с фрагментом '{fragment}'. Ничего не удалено."
+                QtWidgets.QMessageBox.information(self, "Удаление по тексту", msg)
+                self.append_log(msg)
+                return
+
+            save_tsv(path_b, header_b, kept_rows)
+            msg = (
+                f"Удаление по тексту завершено. Удалено строк: {removed} "
+                f"из {original_count} (фрагмент: '{fragment}')."
+            )
+            QtWidgets.QMessageBox.information(self, "Удаление по тексту", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка удаления по тексту: {e}")
+
+    def handle_replace_by_text(self):
+        """
+        Заменить в B все строки, где OriginalText содержит фрагмент,
+        на строки из A с теми же ID.
+        """
+        path_a = self.edit_a.text().strip()
+        path_b = self.edit_b.text().strip()
+        fragment = self._get_text_filter()
+
+        if not path_a or not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите пути к файлам A и B.")
+            return
+        if not fragment:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Введите фрагмент текста для замены.")
+            return
+        if not os.path.isfile(path_a):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл A не найден: {path_a}")
+            return
+
+        try:
+            # Загружаем A и строим словарь ID -> row
+            header_a, rows_a = load_tsv(path_a)
+            id_idx_a = find_column_index(header_a, 'ID', 0)
+            map_a = {}
+            for row in rows_a:
+                if len(row) > id_idx_a:
+                    map_a[row[id_idx_a]] = row
+
+            header_b, rows_b, id_idx_b, text_idx_b = self._load_b_with_indices(path_b)
+
+            size_b = len(header_b)
+
+            def normalize_row(row, size):
+                if len(row) < size:
+                    return row + [''] * (size - len(row))
+                elif len(row) > size:
+                    return row[:size]
+                return row
+
+            replaced = 0
+            affected = 0
+
+            new_rows = []
+            for row in rows_b:
+                if len(row) <= max(id_idx_b, text_idx_b):
+                    new_rows.append(row)
+                    continue
+
+                text = row[text_idx_b]
+                if fragment in text:
+                    affected += 1
+                    row_id = row[id_idx_b]
+                    if row_id in map_a:
+                        # Берём строку из A и приводим к размеру header B
+                            # Берём строку из A и приводим к размеру header B
+                        a_row = normalize_row(map_a[row_id], size_b)
+                        new_rows.append(a_row)
+                        replaced += 1
+                    else:
+                        # В A нет такого ID — оставляем как есть
+                        new_rows.append(row)
+                else:
+                    new_rows.append(row)
+
+            if affected == 0:
+                msg = (
+                    f"В файле B нет строк с фрагментом '{fragment}'. "
+                    f"Замена не выполнялась."
+                )
+                QtWidgets.QMessageBox.information(self, "Замена по тексту", msg)
+                self.append_log(msg)
+                return
+
+            save_tsv(path_b, header_b, new_rows)
+            msg = (
+                f"Замена по тексту завершена. "
+                f"Строк с фрагментом в B: {affected}, "
+                f"заменено по ID из A: {replaced} (фрагмент: '{fragment}')."
+            )
+            QtWidgets.QMessageBox.information(self, "Замена по тексту", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка замены по тексту: {e}")
+
+    def handle_cut_by_text(self):
+        """
+        Вырезать в отдельный файл select_*.tsv все строки из B,
+        где OriginalText содержит фрагмент. B при этом не меняем.
+        """
+        path_b = self.edit_b.text().strip()
+        fragment = self._get_text_filter()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not fragment:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Введите фрагмент текста для вырезки.")
+            return
+        if not os.path.isfile(path_b):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл B не найден: {path_b}")
+            return
+
+        try:
+            header_b, rows_b, id_idx, text_idx = self._load_b_with_indices(path_b)
+
+            selected = []
+            for row in rows_b:
+                if len(row) <= max(id_idx, text_idx):
+                    continue
+                text = row[text_idx]
+                if fragment in text:
+                    row_id = row[id_idx]
+                    selected.append((row_id, text))
+
+            if not selected:
+                msg = f"Строк с фрагментом '{fragment}' в файле B не найдено. Нечего вырезать."
+                QtWidgets.QMessageBox.information(self, "Вырезка по тексту", msg)
+                self.append_log(msg)
+                return
+
+            b_dir = os.path.dirname(path_b)
+            b_name = os.path.basename(path_b)
+            out_name = f"select_{b_name}"
+            out_path = os.path.join(b_dir, out_name)
+
+            # Создаём TSV только с колонками ID и OriginalText
+            with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f, delimiter='\t')
+                writer.writerow(['ID', 'OriginalText'])
+                for rid, txt in selected:
+                    writer.writerow([rid, txt])
+
+            msg = (
+                f"Вырезка по тексту завершена. Строк: {len(selected)}. "
+                f"Файл: {out_path} (ID\\tOriginalText)."
+            )
+            QtWidgets.QMessageBox.information(self, "Вырезка по тексту", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка вырезки по тексту: {e}")
+
+    def handle_create_debug_tsv(self):
+        """
+        Создать debug версию файла B с UUID-тегами.
+        
+        Логика:
+        1. Создаёт или загружает файл {name}_uuid.tsv с ID и UUID
+        2. Проверяет, есть ли новые ID в файле B, которых нет в UUID файле
+        3. Добавляет новые UUID для новых ID
+        4. Создаёт debug_*.tsv, используя UUID из файла {name}_uuid.tsv
+        """
+        path_b = self.edit_b.text().strip()
+
+        if not path_b:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Укажите путь к файлу B.")
+            return
+        if not os.path.isfile(path_b):
+            QtWidgets.QMessageBox.warning(self, "Ошибка", f"Файл B не найден: {path_b}")
+            return
+
+        try:
+            header_b, rows_b = load_tsv(path_b)
+            if not rows_b:
+                QtWidgets.QMessageBox.information(self, "Результат", "Файл B пуст или без данных.")
+                return
+
+            id_idx = find_column_index(header_b, 'ID', 0)
+            text_idx = find_column_index(header_b, 'OriginalText', 1 if len(header_b) > 1 else 0)
+
+            # Определяем пути к файлам
+            b_dir = os.path.dirname(path_b)
+            b_name = os.path.basename(path_b)
+            b_name_no_ext = os.path.splitext(b_name)[0]
+            uuid_file_path = os.path.join(b_dir, f"{b_name_no_ext}_uuid.tsv")
+            debug_file_path = os.path.join(b_dir, f"debug_{b_name}")
+
+            # Загружаем существующий UUID файл или создаём пустой словарь
+            uuid_map: dict[str, str] = {}  # ID -> UUID
+            used_uuids: set[str] = set()
+
+            if os.path.isfile(uuid_file_path):
+                # Загружаем существующие UUID
+                try:
+                    uuid_header, uuid_rows = load_tsv(uuid_file_path)
+                    uuid_id_idx = find_column_index(uuid_header, 'ID', 0)
+                    uuid_uuid_idx = find_column_index(uuid_header, 'UUID', 1 if len(uuid_header) > 1 else 0)
+                    
+                    for row in uuid_rows:
+                        if len(row) > max(uuid_id_idx, uuid_uuid_idx):
+                            row_id = row[uuid_id_idx]
+                            row_uuid = row[uuid_uuid_idx]
+                            uuid_map[row_id] = row_uuid
+                            used_uuids.add(row_uuid)
+                    
+                    self.append_log(f"Загружено UUID из файла: {uuid_file_path} (строк: {len(uuid_map)})")
+                except Exception as e:
+                    self.append_log(f"Предупреждение: не удалось загрузить UUID файл: {e}")
+
+            # Генератор UUID (4 символа из [A-Z, a-z, 1-9])
+            allowed_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz123456789"
+            
+            def gen_uuid() -> str:
+                """Генерирует уникальный UUID из 4 символов."""
+                while True:
+                    uuid = "".join(random.choice(allowed_chars) for _ in range(4))
+                    if uuid not in used_uuids:
+                        used_uuids.add(uuid)
+                        return uuid
+
+            # Собираем все ID из файла B
+            ids_in_b = set()
+            for row in rows_b:
+                if len(row) > id_idx:
+                    row_id = row[id_idx]
+                    if row_id:
+                        ids_in_b.add(row_id)
+
+            # Добавляем UUID для новых ID
+            new_uuids_count = 0
+            for row_id in ids_in_b:
+                if row_id not in uuid_map:
+                    uuid_map[row_id] = gen_uuid()
+                    new_uuids_count += 1
+
+            # Сохраняем UUID файл
+            uuid_rows = [[row_id, uuid_map[row_id]] for row_id in sorted(uuid_map.keys())]
+            save_tsv(uuid_file_path, ['ID', 'UUID'], uuid_rows)
+            
+            if new_uuids_count > 0:
+                self.append_log(f"Добавлено новых UUID: {new_uuids_count}")
+
+            # Создаём debug версию с UUID-тегами
+            new_rows = []
+            tagged_count = 0
+
+            for row in rows_b:
+                if len(row) > max(id_idx, text_idx):
+                    row_id = row[id_idx]
+                    text = row[text_idx]
+                    
+                    if row_id and row_id in uuid_map and text and text.strip():
+                        uuid_tag = uuid_map[row_id]
+                        row = list(row)
+                        row[text_idx] = f"[{uuid_tag}]{text}"
+                        tagged_count += 1
+                new_rows.append(row)
+
+            save_tsv(debug_file_path, header_b, new_rows)
+
+            msg = (
+                f"Создан файл {debug_file_path} с UUID-тегами.\n"
+                f"UUID файл: {uuid_file_path}\n"
+                f"Строк с тегами: {tagged_count}.\n"
+                f"Всего UUID в файле: {len(uuid_map)}."
+            )
+            QtWidgets.QMessageBox.information(self, "Debug TSV", msg)
+            self.append_log(msg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            self.append_log(f"Ошибка создания debug TSV: {e}")
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
