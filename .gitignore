@@ -49,3 +49,4 @@ sort.txt
 select_translation_*.tsv
 *_sort.tsv
 *_debug.tsv
+debug_*.tsv
